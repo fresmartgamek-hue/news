@@ -5,13 +5,16 @@ const path = require("node:path");
 const { createHash, randomBytes, randomUUID, timingSafeEqual } = require("node:crypto");
 
 const ROOT = __dirname;
-const DATA_DIR = path.join(ROOT, ".data");
+const DATA_DIR = path.resolve(process.env.NEWS_DATA_DIR || path.join(ROOT, ".data"));
+const BACKUP_DIR = path.resolve(process.env.NEWS_BACKUP_DIR || path.join(ROOT, ".backups"));
 const UPLOAD_DIR = path.join(DATA_DIR, "uploads");
 const NEWS_FILE = path.join(DATA_DIR, "news.json");
 const PORT = Number(process.env.PORT || 3000);
 const ADMIN_USER = process.env.NEWS_ADMIN_USER || "admin";
 const ADMIN_PASSWORD = process.env.NEWS_ADMIN_PASSWORD;
 const SESSION_TTL = 12 * 60 * 60 * 1000;
+const BACKUP_INTERVAL = 24 * 60 * 60 * 1000;
+const BACKUP_RETENTION = Number(process.env.NEWS_BACKUP_RETENTION || 7);
 const MAX_BODY_BYTES = 125 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 15 * 1024 * 1024;
 const MAX_VIDEO_BYTES = 90 * 1024 * 1024;
@@ -34,9 +37,36 @@ if (!ADMIN_PASSWORD) {
   process.exit(1);
 }
 
+function containsPath(parent, candidate) {
+  const relativePath = path.relative(parent, candidate);
+  return relativePath === "" || (!relativePath.startsWith(`..${path.sep}`) && relativePath !== ".." && !path.isAbsolute(relativePath));
+}
+
+if (containsPath(DATA_DIR, ROOT)) {
+  console.error("NEWS_DATA_DIR must be a dedicated storage directory, not the project root or one of its parents.");
+  process.exit(1);
+}
+
+if (containsPath(DATA_DIR, BACKUP_DIR) || containsPath(BACKUP_DIR, DATA_DIR)) {
+  console.error("NEWS_BACKUP_DIR and NEWS_DATA_DIR must be separate, non-nested directories.");
+  process.exit(1);
+}
+
+if (!Number.isInteger(BACKUP_RETENTION) || BACKUP_RETENTION < 1 || BACKUP_RETENTION > 365) {
+  console.error("NEWS_BACKUP_RETENTION must be a whole number between 1 and 365.");
+  process.exit(1);
+}
+
 const sessions = new Map();
 const loginAttempts = new Map();
 let news = [];
+let storageOperations = Promise.resolve();
+
+function withStorageLock(operation) {
+  const currentOperation = storageOperations.then(operation);
+  storageOperations = currentOperation.catch(() => {});
+  return currentOperation;
+}
 
 async function loadNews() {
   await fs.mkdir(UPLOAD_DIR, { recursive: true });
@@ -54,6 +84,36 @@ async function saveNews(items) {
   const temporary = `${NEWS_FILE}.tmp`;
   await fs.writeFile(temporary, `${JSON.stringify(items, null, 2)}\n`, { mode: 0o600 });
   await fs.rename(temporary, NEWS_FILE);
+}
+
+async function createBackup() {
+  return withStorageLock(async () => {
+    await fs.mkdir(BACKUP_DIR, { recursive: true });
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const snapshotName = `harappa-news-${timestamp}`;
+    const snapshotPath = path.join(BACKUP_DIR, snapshotName);
+    const temporaryPath = path.join(BACKUP_DIR, `.${snapshotName}-${randomUUID()}.tmp`);
+
+    try {
+      await fs.cp(DATA_DIR, temporaryPath, { recursive: true, errorOnExist: true, force: false });
+      await fs.rename(temporaryPath, snapshotPath);
+    } catch (error) {
+      await fs.rm(temporaryPath, { recursive: true, force: true });
+      throw error;
+    }
+
+    const entries = await fs.readdir(BACKUP_DIR, { withFileTypes: true });
+    const snapshots = entries
+      .filter((entry) => entry.isDirectory() && /^harappa-news-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z$/.test(entry.name))
+      .map((entry) => entry.name)
+      .sort()
+      .reverse();
+
+    for (const expiredSnapshot of snapshots.slice(BACKUP_RETENTION)) {
+      await fs.rm(path.join(BACKUP_DIR, expiredSnapshot), { recursive: true });
+    }
+    console.log(`Created news backup: ${snapshotPath}`);
+  });
 }
 
 function sendJson(response, status, value) {
@@ -286,23 +346,25 @@ async function handleApi(request, response, url) {
       return;
     }
     const media = parseUpload(data.media);
-    if (media) await fs.writeFile(path.join(UPLOAD_DIR, media.filename), media.bytes, { flag: "wx", mode: 0o644 });
-    const article = {
-      id: randomUUID(),
-      title: data.title.trim(),
-      body: data.body.trim(),
-      category: data.category,
-      createdAt: new Date().toISOString(),
-      media: media ? { url: `/uploads/${media.filename}`, type: media.mime } : null,
-    };
-    const updatedNews = [article, ...news];
-    try {
-      await saveNews(updatedNews);
-    } catch (error) {
-      if (media) await fs.unlink(path.join(UPLOAD_DIR, media.filename)).catch(() => {});
-      throw error;
-    }
-    news = updatedNews;
+    const article = await withStorageLock(async () => {
+      if (media) await fs.writeFile(path.join(UPLOAD_DIR, media.filename), media.bytes, { flag: "wx", mode: 0o644 });
+      const newArticle = {
+        id: randomUUID(),
+        title: data.title.trim(),
+        body: data.body.trim(),
+        category: data.category,
+        createdAt: new Date().toISOString(),
+        media: media ? { url: `/uploads/${media.filename}`, type: media.mime } : null,
+      };
+      try {
+        await saveNews([newArticle, ...news]);
+      } catch (error) {
+        if (media) await fs.unlink(path.join(UPLOAD_DIR, media.filename)).catch(() => {});
+        throw error;
+      }
+      news = [newArticle, ...news];
+      return newArticle;
+    });
     sendJson(response, 201, article);
     return;
   }
@@ -310,19 +372,23 @@ async function handleApi(request, response, url) {
   const deleteMatch = url.pathname.match(/^\/api\/admin\/news\/([0-9a-f-]{36})$/);
   if (request.method === "DELETE" && deleteMatch) {
     if (!requireAdmin(request, response)) return;
-    const article = news.find((item) => item.id === deleteMatch[1]);
-    if (!article) {
+    const deleted = await withStorageLock(async () => {
+      const article = news.find((item) => item.id === deleteMatch[1]);
+      if (!article) return false;
+      const updatedNews = news.filter((item) => item.id !== article.id);
+      await saveNews(updatedNews);
+      news = updatedNews;
+      if (article.media?.url) {
+        const filename = path.basename(article.media.url);
+        await fs.unlink(path.join(UPLOAD_DIR, filename)).catch((error) => {
+          if (error.code !== "ENOENT") throw error;
+        });
+      }
+      return true;
+    });
+    if (!deleted) {
       sendJson(response, 404, { error: "That story could not be found." });
       return;
-    }
-    const updatedNews = news.filter((item) => item.id !== article.id);
-    await saveNews(updatedNews);
-    news = updatedNews;
-    if (article.media?.url) {
-      const filename = path.basename(article.media.url);
-      await fs.unlink(path.join(UPLOAD_DIR, filename)).catch((error) => {
-        if (error.code !== "ENOENT") throw error;
-      });
     }
     sendJson(response, 200, { deleted: true });
     return;
@@ -390,10 +456,17 @@ const server = http.createServer(async (request, response) => {
   }
 });
 
-loadNews().then(() => {
+loadNews().then(async () => {
+  await createBackup().catch((error) => console.error("Unable to create startup news backup:", error));
+  const backupTimer = setInterval(() => {
+    createBackup().catch((error) => console.error("Unable to create scheduled news backup:", error));
+  }, BACKUP_INTERVAL);
+  backupTimer.unref();
   server.listen(PORT, () => {
     console.log(`News site running at http://localhost:${PORT}`);
     console.log(`Admin page: http://localhost:${PORT}/admin`);
+    console.log(`News storage: ${DATA_DIR}`);
+    console.log(`News backups: ${BACKUP_DIR} (daily, retaining ${BACKUP_RETENTION})`);
   });
 }).catch((error) => {
   console.error("Unable to start the news site:", error);
