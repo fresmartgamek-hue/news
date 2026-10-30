@@ -1,6 +1,15 @@
 const categories = ["Latest", "Local", "World", "Politics", "Business", "Culture", "Sport"];
+const categoryLabels = {
+  Latest: "ताज़ा",
+  Local: "देश",
+  World: "दुनिया",
+  Politics: "राजनीति",
+  Business: "कारोबार",
+  Culture: "मनोरंजन",
+  Sport: "खेल",
+};
 const allowedMediaTypes = new Set(["image/jpeg", "image/png", "image/webp", "image/gif", "video/mp4", "video/webm"]);
-const dateFormatter = new Intl.DateTimeFormat("en", { month: "long", day: "numeric", year: "numeric" });
+const dateFormatter = new Intl.DateTimeFormat("hi-IN", { month: "long", day: "numeric", year: "numeric" });
 
 function formatDate(value) {
   return dateFormatter.format(new Date(value));
@@ -50,7 +59,7 @@ function renderLead(article) {
   const visual = makeElement("div", "lead-visual");
   addMedia(visual, article.media);
   const copy = makeElement("div", "lead-article-copy");
-  const kicker = makeElement("span", "lead-kicker", article.category === "Latest" ? "THE LATEST" : article.category.toUpperCase());
+  const kicker = makeElement("span", "lead-kicker", categoryLabels[article.category] || "ताज़ा");
   const dot = makeElement("span", "live-dot");
   dot.setAttribute("aria-hidden", "true");
   kicker.prepend(dot);
@@ -58,7 +67,7 @@ function renderLead(article) {
   const body = makeElement("p", "", article.body);
   const link = makeElement("a", "text-link", "Read the full story");
   link.href = "#story-" + article.id;
-  const byline = makeElement("span", "lead-byline", `FIELDNOTES NEWSROOM  ·  ${formatDate(article.createdAt)}`);
+  const byline = makeElement("span", "lead-byline", `HARAPPA NEWSROOM  ·  ${formatDate(article.createdAt)}`);
   copy.append(kicker, title, body, link, byline);
   layout.append(visual, copy);
   section.append(layout);
@@ -69,12 +78,12 @@ function renderCard(article) {
   card.id = "story-" + article.id;
   const visual = makeElement("div", "story-image");
   addMedia(visual, article.media);
-  const category = makeElement("span", "story-category", article.category);
+  const category = makeElement("span", "story-category", categoryLabels[article.category] || article.category);
   const title = makeElement("h3", "story-title", article.title);
   const excerpt = makeElement("p", "story-excerpt", article.body);
   const metadata = makeElement("div", "story-meta");
   metadata.append(makeElement("time", "", formatDate(article.createdAt)));
-  if (article.media?.type?.startsWith("video/")) metadata.append(makeElement("span", "story-video-label", "▶  Watch"));
+  if (article.media?.type?.startsWith("video/")) metadata.append(makeElement("span", "story-video-label", "▶  वीडियो देखें"));
   card.append(visual, category, title, excerpt, metadata);
   return card;
 }
@@ -88,8 +97,8 @@ function renderStories() {
   const visibleStories = stories.filter((story) => selectedCategory === "All" || story.category === selectedCategory);
   if (visibleStories.length === 0) {
     grid.append(makeElement("p", "empty-stories", stories.length
-      ? "No stories in this section yet. Choose another section to keep exploring."
-      : "The latest stories will appear here."));
+      ? "इस श्रेणी में अभी खबरें नहीं हैं। दूसरी श्रेणी चुनें।"
+      : "जल्द आ रही हैं नई खबरें।"));
     return;
   }
   visibleStories.forEach((story) => grid.append(renderCard(story)));
@@ -155,6 +164,11 @@ function hideFormError() {
 
 async function loadStories() {
   stories = await api("/api/news");
+  const breakingHeadline = document.querySelector("#breaking-headline");
+  if (breakingHeadline && stories.length) {
+    breakingHeadline.textContent = stories[0].title;
+    breakingHeadline.href = `#story-${stories[0].id}`;
+  }
   const filter = document.querySelector("#category-filter");
   if (filter) renderStories();
   const adminStories = document.querySelector("#published-stories");
@@ -178,8 +192,8 @@ function showLogin(username = "admin") {
   const main = makeElement("main", "login-panel");
   const logo = makeElement("a", "login-logo");
   logo.href = "/";
-  const mark = makeElement("span", "login-mark", "F");
-  const eyebrow = makeElement("div", "eyebrow", "FIELDNOTES NEWSROOM");
+  const mark = makeElement("span", "login-mark", "H");
+  const eyebrow = makeElement("div", "eyebrow", "HARAPPA NEWSROOM");
   const title = makeElement("h1", "", "Welcome back.");
   const description = makeElement("p", "", "Sign in to share the stories your readers need to know about.");
   const form = makeElement("form");
@@ -240,10 +254,10 @@ function makeDashboard() {
   const header = makeElement("header", "admin-header");
   const logo = makeElement("a", "wordmark");
   logo.href = "/";
-  logo.setAttribute("aria-label", "Fieldnotes home");
-  const mark = makeElement("span", "wordmark-icon", "F");
-  const wordmark = makeElement("span", "wordmark-copy", "FIELDNOTES");
-  wordmark.append(makeElement("span", "wordmark-tagline", "INDEPENDENT NEWS, THOUGHTFULLY TOLD"));
+  logo.setAttribute("aria-label", "Harappa News home");
+  const mark = makeElement("span", "wordmark-icon", "H");
+  const wordmark = makeElement("span", "wordmark-copy", "HARAPPA");
+  wordmark.append(makeElement("span", "wordmark-tagline", "NEWS · हर खबर पर नज़र"));
   logo.append(mark, wordmark);
   const headerRight = makeElement("div", "admin-header-right");
   headerRight.append(makeElement("span", "admin-context", "EDITOR WORKSPACE"));
@@ -437,7 +451,18 @@ async function initPublicPage() {
   document.querySelector("#current-year").textContent = String(now.getFullYear());
   document.querySelector("#category-filter").addEventListener("change", (event) => {
     selectedCategory = event.target.value;
+    document.querySelectorAll(".topic-nav a").forEach((link) => {
+      link.classList.toggle("active", link.dataset.category === selectedCategory);
+    });
     renderStories();
+  });
+  document.querySelectorAll(".topic-nav a").forEach((link) => {
+    link.addEventListener("click", () => {
+      selectedCategory = link.dataset.category;
+      document.querySelector("#category-filter").value = selectedCategory;
+      document.querySelectorAll(".topic-nav a").forEach((item) => item.classList.toggle("active", item === link));
+      renderStories();
+    });
   });
   try {
     await loadStories();

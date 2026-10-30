@@ -1,4 +1,4 @@
-# Fieldnotes News
+# Harappa News
 
 A lightweight news website with a public story feed and a password-protected newsroom. Editors can publish stories with text, photos, and videos; readers can browse sections and watch videos directly on the site.
 
